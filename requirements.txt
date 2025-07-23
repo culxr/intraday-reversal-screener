@@ -3,3 +3,4 @@ yfinance
 ta==0.10.2
 mplfinance
 pandas
+lxml
