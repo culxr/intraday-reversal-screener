@@ -1,0 +1,6 @@
+streamlit
+yfinance
+ta
+talib-binary
+mplfinance
+pandas
