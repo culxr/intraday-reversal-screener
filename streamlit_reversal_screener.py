@@ -1,0 +1,150 @@
+
+import streamlit as st
+import yfinance as yf
+import pandas as pd
+import ta
+import talib
+import mplfinance as mpf
+import os
+from datetime import datetime
+import tempfile
+
+st.set_page_config(layout="wide")
+st.title("📈 Intraday Reversal Stock Screener")
+st.markdown("Screening **S&P 500** stocks for potential intraday reversal setups using technical indicators and candlestick patterns.")
+
+@st.cache_data
+def get_sp500_tickers():
+    sp500 = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
+    return sp500['Symbol'].tolist()
+
+@st.cache_data
+def download_data(ticker):
+    df = yf.download(ticker, period='7d', interval='1h', progress=False)
+    return df
+
+def get_support_resistance(data, lookback=20):
+    highs = data['High'].rolling(lookback).max()
+    lows = data['Low'].rolling(lookback).min()
+    return highs.iloc[-1], lows.iloc[-1]
+
+def plot_chart(df, ticker, support=None, resistance=None):
+    df = df.copy()
+    df.index.name = 'Date'
+    bb = ta.volatility.BollingerBands(close=df['Close'])
+    df['bb_high'] = bb.bollinger_hband()
+    df['bb_low'] = bb.bollinger_lband()
+
+    df['hammer'] = talib.CDLHAMMER(df['Open'], df['High'], df['Low'], df['Close'])
+    df['engulfing'] = talib.CDLENGULFING(df['Open'], df['High'], df['Low'], df['Close'])
+    df['doji'] = talib.CDLDOJI(df['Open'], df['High'], df['Low'], df['Close'])
+
+    annotations = []
+    for i in range(len(df)):
+        date = df.index[i]
+        close = df['Close'].iloc[i]
+        label = None
+        if df['hammer'].iloc[i] != 0: label = 'Hammer'
+        elif df['engulfing'].iloc[i] != 0: label = 'Engulfing'
+        elif df['doji'].iloc[i] != 0: label = 'Doji'
+        if label:
+            annotations.append(dict(x=date, y=close, text=label, arrowstyle='->', color='orange'))
+
+    apds = [
+        mpf.make_addplot(df['bb_high'], color='green'),
+        mpf.make_addplot(df['bb_low'], color='red')
+    ]
+
+    hlines = []
+    if support: hlines.append(support)
+    if resistance: hlines.append(resistance)
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmpfile:
+        mpf.plot(
+            df.tail(50),
+            type='candle',
+            style='yahoo',
+            title=f'{ticker} - 1H Candles',
+            ylabel='Price',
+            volume=True,
+            addplot=apds,
+            alines=annotations,
+            hlines=dict(hlines=hlines, colors=['blue', 'purple'], linestyle='--'),
+            savefig=tmpfile.name
+        )
+        return tmpfile.name
+
+st.sidebar.header("Settings")
+max_tickers = st.sidebar.slider("Number of tickers to scan", min_value=10, max_value=100, value=30, step=10)
+
+tickers = get_sp500_tickers()[:max_tickers]
+results = []
+
+with st.spinner("Scanning tickers..."):
+    for ticker in tickers:
+        try:
+            df = download_data(ticker)
+            if df.empty or len(df) < 30:
+                continue
+            df.dropna(inplace=True)
+
+            df['rsi'] = ta.momentum.RSIIndicator(df['Close']).rsi()
+            bb = ta.volatility.BollingerBands(close=df['Close'])
+            df['bb_high'] = bb.bollinger_hband()
+            df['bb_low'] = bb.bollinger_lband()
+            df['atr'] = ta.volatility.AverageTrueRange(df['High'], df['Low'], df['Close']).average_true_range()
+            df['avg_volume'] = df['Volume'].rolling(window=10).mean()
+
+            df['hammer'] = talib.CDLHAMMER(df['Open'], df['High'], df['Low'], df['Close'])
+            df['engulfing'] = talib.CDLENGULFING(df['Open'], df['High'], df['Low'], df['Close'])
+            df['doji'] = talib.CDLDOJI(df['Open'], df['High'], df['Low'], df['Close'])
+
+            last = df.iloc[-1]
+            recent_df = df.iloc[-10:]
+
+            volume_spike = last['Volume'] > 1.5 * last['avg_volume']
+            oversold_confirm = all(recent_df['rsi'] < 35)
+            overbought_confirm = all(recent_df['rsi'] > 65)
+            resistance, support = get_support_resistance(df)
+            price = last['Close']
+            near_support = price < support * 1.02
+            near_resistance = price > resistance * 0.98
+
+            signal = None
+            if oversold_confirm and price < last['bb_low'] and near_support:
+                signal = "Bullish Reversal"
+            elif overbought_confirm and price > last['bb_high'] and near_resistance:
+                signal = "Bearish Reversal"
+
+            candle_signals = []
+            if last['hammer'] != 0: candle_signals.append("Hammer")
+            if last['engulfing'] != 0: candle_signals.append("Engulfing")
+            if last['doji'] != 0: candle_signals.append("Doji")
+
+            if (signal or candle_signals) and volume_spike:
+                results.append({
+                    "Ticker": ticker,
+                    "Price": round(price, 2),
+                    "RSI": round(last['rsi'], 2),
+                    "ATR": round(last['atr'], 2),
+                    "Volume Spike": "Yes",
+                    "Signal": signal or "Candle Pattern",
+                    "Candles": ', '.join(candle_signals),
+                    "Support": round(support, 2),
+                    "Resistance": round(resistance, 2),
+                    "df": df
+                })
+        except:
+            continue
+
+if results:
+    results_df = pd.DataFrame(results).drop(columns=['df'])
+    st.success(f"{len(results)} reversal candidates found.")
+    st.dataframe(results_df)
+
+    for stock in results:
+        with st.expander(f"📊 {stock['Ticker']} - {stock['Signal']}"):
+            chart = plot_chart(stock['df'], stock['Ticker'], stock['Support'], stock['Resistance'])
+            st.image(chart, use_column_width=True)
+else:
+    st.warning("No reversal setups found in selected tickers.")
